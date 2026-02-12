@@ -8,6 +8,7 @@ use std::{
     io,
     marker::PhantomData,
     pin::pin,
+    time::Duration,
 };
 
 use axum_core::{body::Body, extract::Request, response::Response};
@@ -27,9 +28,11 @@ pub use self::listener::{ConnLimiter, ConnLimiterIo, Listener, ListenerExt, TapI
 
 /// Serve the service with the supplied listener.
 ///
-/// This method of running a service is intentionally simple and doesn't support any configuration.
-/// hyper's default configuration applies (including [timeouts]); use hyper or hyper-util if you
-/// need configuration.
+/// This method of running a service is intentionally simple and doesn't support much
+/// configuration. Use hyper or hyper-util directly if you need more control.
+///
+/// The HTTP/1 [header read timeout] defaults to 30 seconds and can be configured via
+/// [`Serve::header_read_timeout`] or disabled via [`Serve::no_header_read_timeout`].
 ///
 /// It supports both HTTP/1 as well as HTTP/2.
 ///
@@ -89,7 +92,7 @@ pub use self::listener::{ConnLimiter, ConnLimiterIo, Listener, ListenerExt, TapI
 /// error. Errors on the TCP socket will be handled by sleeping for a short while (currently, one
 /// second).
 ///
-/// [timeouts]: hyper::server::conn::http1::Builder::header_read_timeout
+/// [header read timeout]: hyper::server::conn::http1::Builder::header_read_timeout
 /// [`Router`]: crate::Router
 /// [`Router::into_make_service_with_connect_info`]: crate::Router::into_make_service_with_connect_info
 /// [`MethodRouter`]: crate::routing::MethodRouter
@@ -111,6 +114,7 @@ where
     Serve {
         listener,
         make_service,
+        header_read_timeout: Some(Duration::from_secs(30)),
         _marker: PhantomData,
     }
 }
@@ -121,6 +125,7 @@ where
 pub struct Serve<L, M, S, B> {
     listener: L,
     make_service: M,
+    header_read_timeout: Option<Duration>,
     _marker: PhantomData<fn(B) -> S>,
 }
 
@@ -129,6 +134,68 @@ impl<L, M, S, B> Serve<L, M, S, B>
 where
     L: Listener,
 {
+    /// Set the HTTP/1 header read timeout.
+    ///
+    /// This is the maximum duration the server will wait for the client to send
+    /// request headers on an HTTP/1 connection. If the timeout expires before
+    /// headers are fully received, the connection is closed.
+    ///
+    /// The default is 30 seconds, matching hyper's default.
+    ///
+    /// Has no effect on HTTP/2 connections.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use std::time::Duration;
+    /// use axum::{Router, routing::get};
+    ///
+    /// # async {
+    /// let router = Router::new().route("/", get(|| async { "Hello, World!" }));
+    ///
+    /// let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
+    /// axum::serve(listener, router)
+    ///     .header_read_timeout(Duration::from_secs(10))
+    ///     .await;
+    /// # };
+    /// ```
+    pub fn header_read_timeout(mut self, timeout: Duration) -> Self {
+        self.header_read_timeout = Some(timeout);
+        self
+    }
+
+    /// Disable the HTTP/1 header read timeout.
+    ///
+    /// This allows clients to take an unlimited amount of time to send request
+    /// headers. This is generally not recommended as it makes the server
+    /// vulnerable to [Slowloris] attacks and can cause idle keep-alive
+    /// connections to remain open indefinitely.
+    ///
+    /// This is primarily provided for backward compatibility with versions
+    /// prior to [#3478], where no header read timeout was enforced.
+    ///
+    /// [Slowloris]: https://en.wikipedia.org/wiki/Slowloris_(computer_security)
+    /// [#3478]: https://github.com/tokio-rs/axum/pull/3478
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use axum::{Router, routing::get};
+    ///
+    /// # async {
+    /// let router = Router::new().route("/", get(|| async { "Hello, World!" }));
+    ///
+    /// let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
+    /// axum::serve(listener, router)
+    ///     .no_header_read_timeout()
+    ///     .await;
+    /// # };
+    /// ```
+    pub fn no_header_read_timeout(mut self) -> Self {
+        self.header_read_timeout = None;
+        self
+    }
+
     /// Prepares a server to handle graceful shutdown when the provided future completes.
     ///
     /// # Example
@@ -162,6 +229,7 @@ where
             listener: self.listener,
             make_service: self.make_service,
             signal,
+            header_read_timeout: self.header_read_timeout,
             _marker: PhantomData,
         }
     }
@@ -189,6 +257,7 @@ where
         let Self {
             mut listener,
             mut make_service,
+            header_read_timeout,
             _marker,
         } = self;
 
@@ -197,7 +266,15 @@ where
 
         loop {
             let (io, remote_addr) = listener.accept().await;
-            handle_connection(&mut make_service, &signal_tx, &close_rx, io, remote_addr).await;
+            handle_connection(
+                &mut make_service,
+                &signal_tx,
+                &close_rx,
+                io,
+                remote_addr,
+                header_read_timeout,
+            )
+            .await;
         }
     }
 }
@@ -212,12 +289,14 @@ where
         let Self {
             listener,
             make_service,
+            header_read_timeout,
             _marker: _,
         } = self;
 
         let mut s = f.debug_struct("Serve");
         s.field("listener", listener)
-            .field("make_service", make_service);
+            .field("make_service", make_service)
+            .field("header_read_timeout", header_read_timeout);
 
         s.finish()
     }
@@ -251,6 +330,7 @@ pub struct WithGracefulShutdown<L, M, S, F, B> {
     listener: L,
     make_service: M,
     signal: F,
+    header_read_timeout: Option<Duration>,
     _marker: PhantomData<fn(B) -> S>,
 }
 
@@ -284,6 +364,7 @@ where
             mut listener,
             mut make_service,
             signal,
+            header_read_timeout,
             _marker,
         } = self;
 
@@ -305,7 +386,15 @@ where
                 }
             };
 
-            handle_connection(&mut make_service, &signal_tx, &close_rx, io, remote_addr).await;
+            handle_connection(
+                &mut make_service,
+                &signal_tx,
+                &close_rx,
+                io,
+                remote_addr,
+                header_read_timeout,
+            )
+            .await;
         }
 
         drop(close_rx);
@@ -332,6 +421,7 @@ where
             listener,
             make_service,
             signal,
+            header_read_timeout,
             _marker: _,
         } = self;
 
@@ -339,6 +429,7 @@ where
             .field("listener", listener)
             .field("make_service", make_service)
             .field("signal", signal)
+            .field("header_read_timeout", header_read_timeout)
             .finish()
     }
 }
@@ -371,6 +462,7 @@ async fn handle_connection<L, M, S, B>(
     close_rx: &watch::Receiver<()>,
     io: <L as Listener>::Io,
     remote_addr: <L as Listener>::Addr,
+    header_read_timeout: Option<Duration>,
 ) where
     L: Listener,
     L::Addr: Debug,
@@ -408,9 +500,13 @@ async fn handle_connection<L, M, S, B>(
         #[allow(unused_mut)]
         let mut builder = Builder::new(TokioExecutor::new());
 
-        // Enable Hyper's default HTTP/1 request header timeout.
+        // Configure HTTP/1 header read timeout. The timer is always set so
+        // that hyper can enforce the timeout. Pass `None` to disable.
         #[cfg(feature = "http1")]
-        builder.http1().timer(TokioTimer::new());
+        builder
+            .http1()
+            .timer(TokioTimer::new())
+            .header_read_timeout(header_read_timeout);
 
         // CONNECT protocol needed for HTTP/2 websockets
         #[cfg(feature = "http2")]
@@ -765,6 +861,71 @@ mod tests {
                 _ = wait_for_server_to_close_conn => (),
             };
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_custom_header_read_timeout() {
+        let custom_timeout = 5;
+        for req in [
+            "GET / HT",                   // stall during request line
+            "GET / HTTP/1.0\r\nAccept: ", // stall during request headers
+        ] {
+            let (mut client, server) = io::duplex(1024);
+            client.write_all(req.as_bytes()).await.unwrap();
+
+            let server_task = async {
+                serve(ReadyListener(Some(server)), Router::new())
+                    .header_read_timeout(Duration::from_secs(custom_timeout))
+                    .await;
+            };
+
+            let wait_for_server_to_close_conn = async {
+                tokio::time::timeout(
+                    Duration::from_secs(custom_timeout + 1),
+                    client.read_to_end(&mut Vec::new()),
+                )
+                .await
+                .expect("timeout: server didn't close connection in time")
+                .expect("read_to_end");
+            };
+
+            tokio::select! {
+                _ = server_task => unreachable!(),
+                _ = wait_for_server_to_close_conn => (),
+            };
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_no_header_read_timeout() {
+        // With header read timeout disabled, a stalled request should NOT
+        // be closed within any reasonable timeout.
+        let (mut client, server) = io::duplex(1024);
+        client
+            .write_all(b"GET / HT")
+            .await
+            .unwrap();
+
+        let server_task = async {
+            serve(ReadyListener(Some(server)), Router::new())
+                .no_header_read_timeout()
+                .await;
+        };
+
+        let wait_for_server_to_close_conn = async {
+            client.read_to_end(&mut Vec::new()).await.unwrap();
+        };
+
+        // The server should NOT close the connection within 60 seconds.
+        let result = tokio::time::timeout(Duration::from_secs(60), async {
+            tokio::select! {
+                _ = server_task => unreachable!(),
+                _ = wait_for_server_to_close_conn => (),
+            }
+        })
+        .await;
+
+        assert!(result.is_err(), "connection should not have been closed");
     }
 
     #[test]

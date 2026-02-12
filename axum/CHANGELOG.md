@@ -15,6 +15,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (never returned `Err`) and be an uninhabited type if `with_graceful_shutdown` is not used
   (because it was already never terminating if that method wasn't used) ([#3601])
 - **added:** New `ListenerExt::limit_connections` allows limiting concurrent `axum::serve` connections ([#3489])
+- **added:** `Serve::header_read_timeout` and `Serve::no_header_read_timeout` for configuring
+  the HTTP/1 header read timeout ([#XXXX])
 - **added:** `MethodRouter::method_filter` ([#3586])
 - **added:** `WebSocketUpgrade::{requested_protocols, set_selected_protocol}` for more
   flexible subprotocol selection ([#3597])
